@@ -1,110 +1,92 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"io/ioutil"
 	"net/http"
 	"strings"
-	"sync"
+	"time"
 )
 
 type Request struct {
-	Site []string `json:"site"`
-	Find string   `json:"find"`
+	Site       []string
+	SearchText string
 }
 
 type Response struct {
-	Founded string `json:"founded"`
+	FoundAtSite string
 }
 
-func f(done chan bool, url string, str string) <-chan string {
-	out := make(chan string)
+func readClient(uri string) (string, error) {
+	resp, err := http.Get(uri)
 
-	go func() {
-		fmt.Printf("START %s\n", url)
-		resp, err := http.Get(url)
-		if err != nil {
-			fmt.Println("error ", err)
-		}
-		defer resp.Body.Close()
+	if err != nil {
+		return "", err
+	}
 
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println("error ", err)
-		}
-		if strings.Contains(string(body), str) {
-			fmt.Printf("Finded %s at %s\n", str, url)
-			select {
-			case out <- url:
-			case <-done:
-				fmt.Printf("%s closed at DONE\n", url)
-				return
-			}
-		}
-		close(out)
-	}()
-	return out
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
 }
 
-func merge(done chan bool, chnls []<-chan string) <-chan string {
-	var wg sync.WaitGroup
+func doSearch(what string, uri string) string {
+	fmt.Println("Starting searching for ", uri)
+	body, err := readClient(uri)
+	var res string
+	if err != nil {
+		fmt.Printf("Error during reading %s\n", err)
+		panic(err)
+	}
+	if strings.Contains(body, what) {
+		res = uri
+	}
+	return res
+}
 
-	out := make(chan string)
+func search(ctx *gin.Context) {
+	// Create context
+	cwt, cancel :=
+		context.WithTimeout(context.Background(), 30000*time.Millisecond)
+	defer cancel()
+	// Read input
+	var req Request
+	err := ctx.BindJSON(&req)
+	if err != nil {
+		ctx.String(http.StatusBadRequest, "Bad")
+		return
+	}
 
-	output := func(c <-chan string) {
-		defer wg.Done()
-		for n := range c {
+	fmt.Println("request is ", req)
+	ch := make(chan string)
+	for _, uri := range req.Site {
+		go func(uri string) {
 			select {
-			case out <- n:
-			case <-done:
+			case ch <- doSearch(req.SearchText, uri):
+			case <-cwt.Done():
 				return
 			}
-		}
-	}
-	wg.Add(len(chnls))
-	for _, c := range chnls {
-		go output(c)
+		}(uri)
 	}
 
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	return out
+	msg := <-ch
+	if len(msg) > 0 {
+		resp := Response{FoundAtSite: msg}
+		ctx.JSON(http.StatusOK, resp)
+	} else {
+		ctx.Status(http.StatusNoContent)
+	}
+	fmt.Println("Writing response to the client")
 }
 
 func main() {
-	r := gin.Default()
-
-	r.POST("/ping", func(c *gin.Context) {
-
-		fmt.Println("--- START ---")
-		done := make(chan bool)
-		defer close(done)
-		var req Request
-		if c.BindJSON(&req) == nil {
-			urls := req.Site
-			find := req.Find
-			chnls := make([]<-chan string, len(urls))
-			for index, url := range urls {
-				chnl := f(done, url, find)
-				chnls[index] = chnl
-			}
-
-			resChnl := merge(done, chnls)
-
-			s := <-resChnl
-			if len(s) > 0 {
-				resp := &Response{s}
-				c.JSON(http.StatusOK, resp)
-			} else {
-				c.Status(http.StatusNoContent)
-			}
-		} else {
-			c.Status(http.StatusBadRequest)
-		}
-	})
-	r.Run() // listen and serve on 0.0.0.0:8080
+	router := gin.Default()
+	router.POST("/ping", search)
+	router.Run(":8080")
 }
